@@ -8,16 +8,17 @@ CAI TIEN V2:
 - Tinh chinh toa do chinh xac hon bang cach quet vung binary
 """
 
-import argparse
-import csv
-import os
-from typing import Dict, List, Optional, Tuple
+import argparse  # Xu li tham so command-line
+import csv  # Doc/ghi file CSV
+import os  # Lam viec voi duong dan file
+import time  # Do thoi gian chay chuong trinh (requirement 5.5)
+from typing import Dict, List, Optional, Tuple  # Type hints
 
-import cv2
-import numpy as np
+import cv2  # OpenCV - xu ly hinh anh
+import numpy as np  # NumPy - tinh toan ma tran
 
-Point = Tuple[int, int]
-Contour = np.ndarray
+Point = Tuple[int, int]  # Diem 2D (x, y)
+Contour = np.ndarray  # Duong contour tu OpenCV
 
 
 def to_console_safe(text: str) -> str:
@@ -126,7 +127,7 @@ def preprocess_image(image: np.ndarray, variant: int = 0) -> np.ndarray:
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    min_area = max(30, int(h * w * 0.00003))
+    min_area = max(3000, int(h * w * 0.00008))
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     cleaned = np.zeros_like(binary)
     for lab in range(1, num_labels):
@@ -223,7 +224,7 @@ def find_finder_patterns(binary: np.ndarray) -> List[Tuple[Contour, Point, float
                 continue
 
             area = abs(float(cv2.contourArea(cnt)))
-            if area < max(350.0, img_area * 0.0018) or area > img_area * 0.30:
+            if area < max(500.0, img_area * 0.008) or area > img_area * 0.30:
                 continue
 
             child_area = abs(float(cv2.contourArea(contours[child_idx])))
@@ -272,6 +273,21 @@ def find_finder_patterns(binary: np.ndarray) -> List[Tuple[Contour, Point, float
 
 
 def build_qr_quads(patterns: List[Tuple[Contour, Point, float]], image_shape: Tuple[int, ...]) -> List[np.ndarray]:
+    """
+    Từ danh sách `patterns` (mỗi phần tử là (contour, center, area)) và kích thước ảnh,
+    xây các tứ giác (quads) ứng viên cho QR code.
+
+    Tham số:
+      - patterns: List[Tuple[Contour, Point, float]]
+          Danh sách finder patterns: (contour, (cx, cy), area).
+      - image_shape: Tuple[int,...]
+          Kích thước ảnh (H, W, ...), dùng để loại các cấu hình bất hợp lý.
+
+    Trả về:
+      - List[np.ndarray]: Mỗi phần tử là mảng shape (4,2) dtype float32 biểu diễn 4 góc
+        của tứ giác ứng viên (toạ độ ảnh). Thứ tự điểm có thể chưa sắp xếp theo quy ước,
+        các hàm tiếp theo sẽ chuẩn hoá thứ tự nếu cần.
+    """
     if len(patterns) < 3:
         return []
 
@@ -376,7 +392,7 @@ def build_qr_quads(patterns: List[Tuple[Contour, Point, float]], image_shape: Tu
                     quad = np.array([tl_pt, tr_pt, br_pt, bl_pt], dtype=np.float32)
 
                     area_q = abs(float(cv2.contourArea(quad)))
-                    if area_q < 800:
+                    if area_q < 2000:
                         continue
 
                     inside = np.sum(
@@ -399,6 +415,20 @@ def build_qr_quads(patterns: List[Tuple[Contour, Point, float]], image_shape: Tu
 
 
 def suppress_overlapping_quads(quads: List[np.ndarray], iou_threshold: float = 0.30) -> List[np.ndarray]:
+    """
+    Loại bỏ các tứ giác (quad) chồng lấp bằng cách sắp xếp theo điểm số
+    và giữ những quad có độ ưu tiên cao hơn.
+
+    Tham số:
+      - quads: List[np.ndarray]
+          Danh sách các tứ giác ứng viên, mỗi phần tử là mảng (4,2) float32.
+      - iou_threshold: float
+          Ngưỡng IoU (axis-aligned intersection over union trên bounding boxes) để
+          coi hai vùng là chồng lấp (mặc định 0.30). Nếu IoU >= ngưỡng thì sẽ loại quad thấp hơn.
+
+    Trả về:
+      - List[np.ndarray]: Danh sách các quads đã được lọc (không chồng lấp nhiều theo ngưỡng).
+    """
     if not quads:
         return []
 
@@ -784,6 +814,19 @@ def detect_qr_by_outline(img: np.ndarray, max_candidates: int = 4) -> List[np.nd
 
 
 def fallback_corner_cluster_quads(image: np.ndarray, max_candidates: int = 2) -> List[np.ndarray]:
+    """
+    Phương pháp dự phòng: tìm cụm góc (corner clusters) để đoán vùng chứa QR khi
+    phương pháp finder-pattern không đủ hiệu quả.
+
+    Tham số:
+      - image: np.ndarray
+          Ảnh BGR hoặc grayscale.
+      - max_candidates: int
+          Số lượng ứng viên tối đa để trả về (mặc định: 2).
+
+    Trả về:
+      - List[np.ndarray]: Danh sách các tứ giác axis-aligned (4 góc float32) ứng viên.
+    """
     if image is None or image.size == 0:
         return []
 
@@ -1100,36 +1143,77 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
 # ===========================================================================
 
 def polygon_signed_area(poly: np.ndarray) -> float:
-    if poly is None or len(poly) < 3:
-        return 0.0
-    x = poly[:, 0]
-    y = poly[:, 1]
-    return 0.5 * float(np.sum(x * np.roll(y, -1) - y * np.roll(x, -1)))
+        """
+        Tính diện tích có hướng (signed area) của đa giác `poly`.
+
+        Tham số:
+            - poly: np.ndarray (N,2) hoặc tương tự
+        Trả về:
+            - float: diện tích (có dấu). Giá trị âm nếu thứ tự điểm là clockwise.
+        """
+        if poly is None or len(poly) < 3:
+                return 0.0
+        x = poly[:, 0]
+        y = poly[:, 1]
+        return 0.5 * float(np.sum(x * np.roll(y, -1) - y * np.roll(x, -1)))
 
 
 def polygon_area(poly: np.ndarray) -> float:
-    return abs(polygon_signed_area(poly))
+        """
+        Diện tích (không dấu) của đa giác `poly`.
+
+        Tham số:
+            - poly: np.ndarray (N,2)
+        Trả về:
+            - float: diện tích dương của đa giác.
+        """
+        return abs(polygon_signed_area(poly))
 
 
 def ensure_ccw(poly: np.ndarray) -> np.ndarray:
-    p = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
-    if len(p) >= 3 and polygon_signed_area(p) < 0:
-        p = p[::-1]
-    return p
+        """
+        Đảm bảo thứ tự điểm của đa giác là counter-clockwise (CCW).
+
+        Tham số:
+            - poly: np.ndarray (N,2)
+        Trả về:
+            - np.ndarray: đa giác đã được đảo thứ tự nếu cần, dtype float32
+        """
+        p = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
+        if len(p) >= 3 and polygon_signed_area(p) < 0:
+                p = p[::-1]
+        return p
 
 
 def line_intersection(p1: np.ndarray, p2: np.ndarray, q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    r = p2 - p1
-    s = q2 - q1
-    denom = float(r[0] * s[1] - r[1] * s[0])
-    if abs(denom) < 1e-9:
-        return p2.copy()
-    qp = q1 - p1
-    t = float((qp[0] * s[1] - qp[1] * s[0]) / denom)
-    return p1 + t * r
+        """
+        Tinh giao diem cua 2 doan thang (p1-p2) va (q1-q2).
+
+        Tham so:
+            - p1, p2, q1, q2: np.ndarray co 2 phan tu (x,y)
+        Tra ve:
+            - np.ndarray (2,) la diem giao tuyen. Neu 2 doan song song, tra ve p2 copy.
+        """
+        r = p2 - p1
+        s = q2 - q1
+        denom = float(r[0] * s[1] - r[1] * s[0])
+        if abs(denom) < 1e-9:
+                return p2.copy()
+        qp = q1 - p1
+        t = float((qp[0] * s[1] - qp[1] * s[0]) / denom)
+        return p1 + t * r
 
 
 def clip_polygon_sutherland_hodgman(subject: np.ndarray, clipper: np.ndarray) -> np.ndarray:
+    """
+    Thuật toán Sutherland–Hodgman để clip (cắt) một đa giác `subject` bởi đa giác `clipper`.
+
+    Tham số:
+      - subject: np.ndarray (N,2) - đa giác cần cắt
+      - clipper: np.ndarray (M,2) - đa giác cắt (cửa sổ clip)
+    Trả về:
+      - np.ndarray (K,2): đa giác giao (có thể rỗng)
+    """
     out = ensure_ccw(subject)
     clip = ensure_ccw(clipper)
     if len(out) < 3 or len(clip) < 3:
@@ -1159,6 +1243,14 @@ def clip_polygon_sutherland_hodgman(subject: np.ndarray, clipper: np.ndarray) ->
 
 
 def quad_iou(quad_a: np.ndarray, quad_b: np.ndarray) -> float:
+    """
+    Tính IoU giữa hai tứ giác (không phải bounding box hướng trục).
+
+    Tham số:
+      - quad_a, quad_b: np.ndarray dạng (4,2) hoặc tương tự (các góc của tứ giác)
+    Trả về:
+      - float: IoU (giao / hợp) trên diện tích hình chữ nhật/quadrilateral.
+    """
     qa = ensure_ccw(np.asarray(quad_a, dtype=np.float32).reshape(4, 2))
     qb = ensure_ccw(np.asarray(quad_b, dtype=np.float32).reshape(4, 2))
     area_a = polygon_area(qa)
@@ -1307,12 +1399,28 @@ def evaluate_csvs(pred_csv: str, gt_csv: str, iou_threshold: float = 0.5,
 
 
 def main() -> None:
+    """
+    Hàm chính xử lý phát hiện QR code theo yêu cầu specification 5.5.
+    - Đo tổng thời gian chạy (wall-clock time) từ lúc bắt đầu đến lúc kết thúc
+    - Hiển thị thống kê tốc độ: giây/ảnh (chuẩn hóa trên số lượng ảnh)
+    - Máy chấm sử dụng CPU (không có GPU)
+    """
+    # Ghi lại thời gian bắt đầu chương trình (wall-clock time)
+    start_time = time.time()
+    
+    # Khởi tạo argument parser để xử lý các tham số command-line
     parser = argparse.ArgumentParser(description="Phat hien QR code trong anh (khong dung detector co san)")
+    # --data: Đường dẫn file CSV chứa danh sách ảnh cần xử lý (bắt buộc khi không dùng --eval-only)
     parser.add_argument("--data", default="", help="Duong dan file CSV co cot image_path")
+    # --gt: Đường dẫn file ground-truth CSV để so sánh kết quả (tùy chọn)
     parser.add_argument("--gt", default="", help="File ground-truth CSV de cham (tuy chon)")
+    # --iou-threshold: Ngưỡng IoU để xác định match giữa dự đoán và ground-truth (giá trị mặc định: 0.5)
     parser.add_argument("--iou-threshold", type=float, default=0.5)
+    # --eval-only: Hoạt động đánh giá chỉ (không xử lý ảnh, chỉ so sánh prediction với ground-truth)
     parser.add_argument("--eval-only", action="store_true")
+    # --pred: Đường dẫn file prediction khi dùng mode --eval-only
     parser.add_argument("--pred", default="")
+    # --valid: Đường dẫn file ground-truth khi dùng mode --eval-only
     parser.add_argument("--valid", default="")
     args = parser.parse_args()
 
@@ -1406,6 +1514,23 @@ def main() -> None:
             evaluate_csvs(output_path, auto_valid,
                           iou_threshold=float(args.iou_threshold),
                           filter_ids=data_image_ids if data_image_ids else None)
+        
+        # ===== DANH GIA TOC DO (theo requirement 5.5) =====
+        # Tính toán tổng thời gian chạy (wall-clock time) từ lúc bắt đầu đến hiện tại
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        # Chuẩn hóa tốc độ: giây/ảnh (seconds per image)
+        speed_per_image = total_time / total_images if total_images > 0 else 0.0
+        
+        # Hiển thị thống kê tốc độ ra terminal
+        print(f"{'='*70}")
+        print(f"THONG KE TOC DO (requirement 5.5)")
+        print(f"{'='*70}")
+        print(f"Tong so anh: {total_images}")
+        print(f"Tong thoi gian chay (wall-clock time): {total_time:.2f} giay")
+        print(f"Toc do trung binh: {speed_per_image:.4f} giay/anh")
+        print(f"{'='*70}\n")
 
     except Exception as e:
         print(f"\nLOI XU LY DU LIEU: {e}")
