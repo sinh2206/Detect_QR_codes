@@ -12,7 +12,7 @@ import argparse  # Xu li tham so command-line
 import csv  # Doc/ghi file CSV
 import os  # Lam viec voi duong dan file
 import time  # Do thoi gian chay chuong trinh (requirement 5.5)
-from typing import Dict, List, Optional, Tuple  # Type hints
+from typing import Dict, List, Optional, Tuple, Union  # Type hints
 
 import cv2  # OpenCV - xu ly hinh anh
 import numpy as np  # NumPy - tinh toan ma tran
@@ -48,6 +48,25 @@ def read_image_any_path(image_path: str) -> Optional[np.ndarray]:
         return None
 
 
+def write_image_any_path(image_path: str, image: np.ndarray) -> bool:
+    if image is None or image.size == 0:
+        return False
+    ext = os.path.splitext(image_path)[1]
+    if ext == "":
+        ext = ".png"
+    ok = cv2.imwrite(image_path, image)
+    if ok:
+        return True
+    try:
+        success, encoded = cv2.imencode(ext, image)
+        if success:
+            encoded.tofile(image_path)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def order_quad_clockwise_start_top_left(quad: np.ndarray) -> np.ndarray:
     q = np.asarray(quad, dtype=np.float32).reshape(4, 2)
     center = np.mean(q, axis=0)
@@ -70,6 +89,92 @@ def bbox_iou_xyxy(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) ->
     if union <= 1e-9:
         return 0.0
     return inter / union
+
+
+def boxes_overlap_or_touch(
+    a: Tuple[int, int, int, int],
+    b: Tuple[int, int, int, int],
+    margin: int = 0,
+) -> bool:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    if ax2 + margin < bx1:
+        return False
+    if bx2 + margin < ax1:
+        return False
+    if ay2 + margin < by1:
+        return False
+    if by2 + margin < ay1:
+        return False
+    return True
+
+
+def quad_to_box_int(quad: np.ndarray) -> Tuple[int, int, int, int]:
+    q = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    return (
+        int(np.floor(np.min(q[:, 0]))),
+        int(np.floor(np.min(q[:, 1]))),
+        int(np.ceil(np.max(q[:, 0]))),
+        int(np.ceil(np.max(q[:, 1]))),
+    )
+
+
+def expand_axis_aligned_quad(
+    quad: np.ndarray,
+    image_shape: Tuple[int, int],
+    pad_ratio: float = 0.12,
+    min_pad: int = 4,
+    max_pad: int = 44,
+) -> np.ndarray:
+    q = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    h, w = int(image_shape[0]), int(image_shape[1])
+    x1, y1, x2, y2 = quad_to_box_int(q)
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+
+    base = int(round(pad_ratio * float(min(bw, bh))))
+    pad = max(min_pad, min(max_pad, base))
+    pad_x = max(pad, int(round(0.04 * bw)))
+    pad_y = max(pad, int(round(0.04 * bh)))
+
+    nx1 = max(0, x1 - pad_x)
+    ny1 = max(0, y1 - pad_y)
+    nx2 = min(w, x2 + pad_x)
+    ny2 = min(h, y2 + pad_y)
+
+    return np.array([[nx1, ny1], [nx2, ny1], [nx2, ny2], [nx1, ny2]], dtype=np.float32)
+
+
+def add_quad_to_mask(mask: np.ndarray, quad: np.ndarray, dilate_px: int = 0) -> None:
+    if mask is None or mask.size == 0:
+        return
+    q = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    h, w = mask.shape[:2]
+    q_int = np.round(q).astype(np.int32)
+    q_int[:, 0] = np.clip(q_int[:, 0], 0, w - 1)
+    q_int[:, 1] = np.clip(q_int[:, 1], 0, h - 1)
+    cv2.fillPoly(mask, [q_int.reshape(-1, 1, 2)], 255)
+    if dilate_px > 0:
+        k = 2 * dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        cv2.dilate(mask, kernel, dst=mask, iterations=1)
+
+
+def masked_overlap_ratio(quad: np.ndarray, mask: np.ndarray) -> float:
+    if mask is None or mask.size == 0:
+        return 0.0
+    q = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    h, w = mask.shape[:2]
+    q_int = np.round(q).astype(np.int32)
+    q_int[:, 0] = np.clip(q_int[:, 0], 0, w - 1)
+    q_int[:, 1] = np.clip(q_int[:, 1], 0, h - 1)
+    tmp = np.zeros_like(mask)
+    cv2.fillPoly(tmp, [q_int.reshape(-1, 1, 2)], 255)
+    area = cv2.countNonZero(tmp)
+    if area <= 0:
+        return 0.0
+    inter = cv2.countNonZero(cv2.bitwise_and(tmp, mask))
+    return float(inter) / float(area)
 
 
 def preprocess_image(image: np.ndarray, variant: int = 0) -> np.ndarray:
@@ -394,6 +499,13 @@ def build_qr_quads(patterns: List[Tuple[Contour, Point, float]], image_shape: Tu
                     area_q = abs(float(cv2.contourArea(quad)))
                     if area_q < 2000:
                         continue
+                    # Sanity theo kich thuoc suy ra tu 3 finder centers.
+                    side_est = 0.5 * (d_tl_tr + d_tl_bl) + 7.0 * module_size_px
+                    area_est = side_est * side_est
+                    if area_est > 1.0 and not (0.22 * area_est <= area_q <= 2.8 * area_est):
+                        continue
+                    if area_q > float(h * w) * 0.38:
+                        continue
 
                     inside = np.sum(
                         (quad[:, 0] >= -0.05 * w)
@@ -414,7 +526,13 @@ def build_qr_quads(patterns: List[Tuple[Contour, Point, float]], image_shape: Tu
     return quads
 
 
-def suppress_overlapping_quads(quads: List[np.ndarray], iou_threshold: float = 0.30) -> List[np.ndarray]:
+def suppress_overlapping_quads(
+    quads: List[np.ndarray],
+    iou_threshold: float = 0.30,
+    image_shape: Optional[Tuple[int, int]] = None,
+    return_regions: bool = False,
+    touch_margin: int = 1,
+) -> Union[List[np.ndarray], Tuple[List[np.ndarray], List[np.ndarray]]]:
     """
     Loại bỏ các tứ giác (quad) chồng lấp bằng cách sắp xếp theo điểm số
     và giữ những quad có độ ưu tiên cao hơn.
@@ -430,7 +548,7 @@ def suppress_overlapping_quads(quads: List[np.ndarray], iou_threshold: float = 0
       - List[np.ndarray]: Danh sách các quads đã được lọc (không chồng lấp nhiều theo ngưỡng).
     """
     if not quads:
-        return []
+        return ([], []) if return_regions else []
 
     scored = []
     for quad in quads:
@@ -449,13 +567,30 @@ def suppress_overlapping_quads(quads: List[np.ndarray], iou_threshold: float = 0
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
+    if image_shape is not None:
+        h_mask, w_mask = int(image_shape[0]), int(image_shape[1])
+    else:
+        max_x = int(max(v[2][2] for v in scored) + 3)
+        max_y = int(max(v[2][3] for v in scored) + 3)
+        h_mask = max(8, max_y)
+        w_mask = max(8, max_x)
+    occupied_mask = np.zeros((h_mask, w_mask), dtype=np.uint8)
+
     selected: List[np.ndarray] = []
     selected_boxes: List[Tuple[float, float, float, float]] = []
+    selected_regions: List[np.ndarray] = []
     for _, q, b in scored:
         bx1, by1, bx2, by2 = b
         barea = max(1e-6, (bx2 - bx1) * (by2 - by1))
         keep = True
+
+        overlap_region = masked_overlap_ratio(q, occupied_mask)
+        if overlap_region > 0.001:
+            keep = False
+
         for sb in selected_boxes:
+            if not keep:
+                break
             sx1, sy1, sx2, sy2 = sb
             sarea = max(1e-6, (sx2 - sx1) * (sy2 - sy1))
             ix1, iy1 = max(bx1, sx1), max(by1, sy1)
@@ -465,12 +600,23 @@ def suppress_overlapping_quads(quads: List[np.ndarray], iou_threshold: float = 0
             union = barea + sarea - inter
             iou = inter / max(1e-6, union)
             overlap_min = inter / max(1e-6, min(barea, sarea))
-            if iou >= iou_threshold or overlap_min >= 0.58:
+            touch_conflict = False
+            if touch_margin >= 0:
+                touch_conflict = boxes_overlap_or_touch(
+                    (int(bx1), int(by1), int(bx2), int(by2)),
+                    (int(sx1), int(sy1), int(sx2), int(sy2)),
+                    margin=touch_margin,
+                )
+            if iou >= iou_threshold or overlap_min >= 0.58 or touch_conflict:
                 keep = False
                 break
         if keep:
             selected.append(q)
             selected_boxes.append(b)
+            selected_regions.append(q.copy())
+            add_quad_to_mask(occupied_mask, q, dilate_px=max(1, touch_margin))
+    if return_regions:
+        return selected, selected_regions
     return selected
 
 
@@ -691,6 +837,37 @@ def refine_bbox_by_scanning(
     else:
         new_x2 = x2
 
+    # Thu hep them de tang IoU: cat bo bien ria thua theo projection trong ROI moi.
+    roi2_x1 = max(0, min(pw, new_x1 - sx1))
+    roi2_x2 = max(0, min(pw, new_x2 - sx1))
+    roi2_y1 = max(0, min(ph, new_y1 - sy1))
+    roi2_y2 = max(0, min(ph, new_y2 - sy1))
+    if (roi2_x2 - roi2_x1) >= 6 and (roi2_y2 - roi2_y1) >= 6:
+        roi_bin = binary[roi2_y1:roi2_y2, roi2_x1:roi2_x2]
+        row_ratio = np.mean(roi_bin > 0, axis=1)
+        col_ratio = np.mean(roi_bin > 0, axis=0)
+
+        row_nonzero = row_ratio[row_ratio > 0]
+        col_nonzero = col_ratio[col_ratio > 0]
+        row_thr = 0.10 if row_nonzero.size == 0 else max(0.08, float(np.percentile(row_nonzero, 35)) * 0.70)
+        col_thr = 0.10 if col_nonzero.size == 0 else max(0.08, float(np.percentile(col_nonzero, 35)) * 0.70)
+
+        row_idx = np.where(row_ratio >= row_thr)[0]
+        col_idx = np.where(col_ratio >= col_thr)[0]
+        if row_idx.size >= 2 and col_idx.size >= 2:
+            trim_y1 = int(row_idx[0])
+            trim_y2 = int(row_idx[-1]) + 1
+            trim_x1 = int(col_idx[0])
+            trim_x2 = int(col_idx[-1]) + 1
+
+            test_x1 = roi2_x1 + trim_x1 + sx1
+            test_x2 = roi2_x1 + trim_x2 + sx1
+            test_y1 = roi2_y1 + trim_y1 + sy1
+            test_y2 = roi2_y1 + trim_y2 + sy1
+            if (test_x2 - test_x1) >= 6 and (test_y2 - test_y1) >= 6:
+                new_x1, new_x2 = test_x1, test_x2
+                new_y1, new_y2 = test_y1, test_y2
+
     # Dam bao thu tu dung
     if new_x1 >= new_x2:
         new_x1, new_x2 = x1, x2
@@ -700,7 +877,170 @@ def refine_bbox_by_scanning(
     return int(new_x1), int(new_y1), int(new_x2), int(new_y2)
 
 
-def detect_qr_by_outline(img: np.ndarray, max_candidates: int = 4) -> List[np.ndarray]:
+def verify_qr_finder_signature(patch_gray: np.ndarray) -> bool:
+    """
+    Xac thuc patch co cau truc finder pattern QR:
+    - Loi den 3x3
+    - Vanh trang 5x5
+    - Vanh den ngoai 7x7
+    (thong qua contour long nhau + hinh hoc 3 finder patterns).
+    """
+    if patch_gray is None or patch_gray.size == 0:
+        return False
+
+    h, w = patch_gray.shape[:2]
+    if h < 24 or w < 24:
+        return False
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+    enhanced = clahe.apply(patch_gray)
+    blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+    binaries: List[np.ndarray] = []
+    _, bin_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    binaries.append(bin_otsu)
+
+    for block, cval in ((11, 2), (15, 3)):
+        if min(h, w) <= block:
+            continue
+        binaries.append(
+            cv2.adaptiveThreshold(
+                blurred,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                block,
+                cval,
+            )
+        )
+
+    best_patterns: List[Tuple[np.ndarray, float]] = []
+    for binary in binaries:
+        contours, hierarchy = cv2.findContours(binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is None:
+            continue
+        hierarchy = hierarchy[0]
+
+        candidates: List[Tuple[np.ndarray, float]] = []
+        for i, outer in enumerate(contours):
+            child = hierarchy[i][2]
+            if child == -1:
+                continue
+            grandchild = hierarchy[child][2]
+            if grandchild == -1:
+                continue
+
+            cnts = (outer, contours[child], contours[grandchild])
+            areas: List[float] = []
+            centers: List[np.ndarray] = []
+            ok = True
+            for cnt in cnts:
+                area = abs(float(cv2.contourArea(cnt)))
+                if area < 10:
+                    ok = False
+                    break
+
+                x, y, cw, ch = cv2.boundingRect(cnt)
+                if cw < 3 or ch < 3:
+                    ok = False
+                    break
+
+                ratio = max(cw, ch) / max(1.0, min(cw, ch))
+                fill = area / max(1.0, float(cw * ch))
+                if ratio > 2.3 or fill < 0.25:
+                    ok = False
+                    break
+
+                m = cv2.moments(cnt)
+                if abs(m["m00"]) < 1e-6:
+                    ok = False
+                    break
+
+                cx = float(m["m10"] / m["m00"])
+                cy = float(m["m01"] / m["m00"])
+                centers.append(np.array([cx, cy], dtype=np.float32))
+                areas.append(area)
+
+            if not ok:
+                continue
+
+            area_o, area_m, area_i = areas
+            if not (area_o > area_m > area_i):
+                continue
+
+            ratio_om = area_o / max(1e-6, area_m)
+            ratio_mi = area_m / max(1e-6, area_i)
+            if not (1.15 <= ratio_om <= 5.5 and 1.15 <= ratio_mi <= 7.0):
+                continue
+
+            _, _, bw, bh = cv2.boundingRect(outer)
+            if max(
+                np.linalg.norm(centers[0] - centers[1]),
+                np.linalg.norm(centers[0] - centers[2]),
+                np.linalg.norm(centers[1] - centers[2]),
+            ) > max(bw, bh) * 0.65:
+                continue
+
+            candidates.append((centers[0], area_o))
+
+        uniq: List[Tuple[np.ndarray, float]] = []
+        for center, area in sorted(candidates, key=lambda x: x[1], reverse=True):
+            duplicated = False
+            for old_center, old_area in uniq:
+                if (
+                    np.linalg.norm(center - old_center) < 4.0
+                    and min(area, old_area) / max(1e-6, max(area, old_area)) > 0.60
+                ):
+                    duplicated = True
+                    break
+            if not duplicated:
+                uniq.append((center, area))
+
+        if len(uniq) > len(best_patterns):
+            best_patterns = uniq
+
+    if len(best_patterns) < 3:
+        return False
+
+    best_centers = [c for c, _ in best_patterns]
+    n = len(best_centers)
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                pts = [best_centers[i], best_centers[j], best_centers[k]]
+                d01 = float(np.linalg.norm(pts[1] - pts[0]))
+                d02 = float(np.linalg.norm(pts[2] - pts[0]))
+                d12 = float(np.linalg.norm(pts[2] - pts[1]))
+                lens = [d01, d02, d12]
+
+                longest_idx = int(np.argmax(lens))
+                long_edge = lens[longest_idx]
+                pair = [(0, 1), (0, 2), (1, 2)][longest_idx]
+                right_idx = ({0, 1, 2} - set(pair)).pop()
+                a_idx, b_idx = [u for u in (0, 1, 2) if u != right_idx]
+
+                va = pts[a_idx] - pts[right_idx]
+                vb = pts[b_idx] - pts[right_idx]
+                la = float(np.linalg.norm(va))
+                lb = float(np.linalg.norm(vb))
+                if la < 4.0 or lb < 4.0:
+                    continue
+
+                cos_val = abs(float(np.dot(va, vb) / (la * lb)))
+                len_ratio = min(la, lb) / max(la, lb)
+                hyp = float(np.sqrt(la * la + lb * lb))
+
+                if cos_val < 0.58 and len_ratio > 0.35 and 0.70 * hyp <= long_edge <= 1.45 * hyp:
+                    return True
+
+    return False
+
+
+def detect_qr_by_outline(
+    img: np.ndarray,
+    max_candidates: int = 4,
+    blocked_mask: Optional[np.ndarray] = None,
+) -> List[np.ndarray]:
     """
     Phat hien QR code bang phan tich contour truc tiep.
     Tim cac vung co:
@@ -741,8 +1081,12 @@ def detect_qr_by_outline(img: np.ndarray, max_candidates: int = 4) -> List[np.nd
     variants.append(bin3)
 
     for binary_raw in variants:
-        # Ket noi cac module QR
-        k_sizes = [max(3, int(min(H, W) / 80)), max(3, int(min(H, W) / 40))]
+        # CAI TIEN: Dung nhieu kich thuoc kernel nho hon de tranh gop QR gan nhau
+        # k_small de tim QR lon (it dong chua lam bridge)
+        # k_large de tim QR nho (can dong nhieu hon)
+        k_small = max(3, int(min(H, W) / 120))  # ~5px cho 640px anh
+        k_large = max(3, int(min(H, W) / 60))   # ~10px cho 640px anh
+        k_sizes = [k_small, k_large]
         for k in k_sizes:
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
             binary = cv2.morphologyEx(binary_raw, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -751,7 +1095,7 @@ def detect_qr_by_outline(img: np.ndarray, max_candidates: int = 4) -> List[np.nd
 
             for cnt in contours:
                 area = cv2.contourArea(cnt)
-                if area < 200 or area > H * W * 0.5:
+                if area < 140 or area > H * W * 0.38:
                     continue
 
                 x, y, cw, ch = cv2.boundingRect(cnt)
@@ -760,29 +1104,68 @@ def detect_qr_by_outline(img: np.ndarray, max_candidates: int = 4) -> List[np.nd
 
                 # Ty le canh: khong qua bien dang
                 ratio = max(cw, ch) / max(1, min(cw, ch))
-                if ratio > 4.0:
+                if ratio > 3.4:
+                    continue
+
+                fill_rect = area / max(1.0, float(cw * ch))
+                if fill_rect < 0.28 or fill_rect > 0.96:
                     continue
 
                 # Kiem tra texture (chuyen doi den/trang)
-                patch_gray = gray[y:y + ch, x:x + cw]
+                # CAI TIEN: expand patch de tim finder pattern day du hon
+                exp_o = max(int(max(cw, ch) * 0.10), 8)
+                ex1 = max(0, x - exp_o); ey1 = max(0, y - exp_o)
+                ex2 = min(W, x + cw + exp_o); ey2 = min(H, y + ch + exp_o)
+                patch_gray = gray[ey1:ey2, ex1:ex2]
                 if patch_gray.size < 100:
                     continue
-                patch_small = cv2.resize(patch_gray, (48, 48), interpolation=cv2.INTER_AREA)
-                _, patch_bin = cv2.threshold(patch_small, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                patch_small = cv2.resize(gray[y:y + ch, x:x + cw], (48, 48), interpolation=cv2.INTER_AREA)
+                _, patch_bin = cv2.threshold(patch_small, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
                 row_trans = np.mean(np.sum(patch_bin[:, 1:] != patch_bin[:, :-1], axis=1) / 47.0)
                 col_trans = np.mean(np.sum(patch_bin[1:, :] != patch_bin[:-1, :], axis=0) / 47.0)
                 transition_score = 0.5 * (row_trans + col_trans)
 
-                if transition_score < 0.10:
+                if transition_score < 0.085:
                     continue
 
-                # Kiem tra fill ratio
+                # Bat buoc patch (da expand) phai co chu ky finder pattern 7x7
+                if not verify_qr_finder_signature(patch_gray):
+                    continue
+
+                # Loai bo vung co dang chu cai: qua it module trung gian.
+                cell = 6
+                dark_cells = 0
+                mixed_cells = 0
+                for gy in range(cell):
+                    for gx in range(cell):
+                        y0 = gy * (48 // cell)
+                        y1c = 48 if gy == cell - 1 else (gy + 1) * (48 // cell)
+                        x0 = gx * (48 // cell)
+                        x1c = 48 if gx == cell - 1 else (gx + 1) * (48 // cell)
+                        ratio_dark = float(np.mean(patch_bin[y0:y1c, x0:x1c] > 0))
+                        if ratio_dark > 0.18:
+                            dark_cells += 1
+                        if 0.12 <= ratio_dark <= 0.88:
+                            mixed_cells += 1
+                if dark_cells < 10 or mixed_cells < 8:
+                    continue
+
+                num_labels, _, stats, _ = cv2.connectedComponentsWithStats(patch_bin, connectivity=8)
+                comp_count = 0
+                for lab in range(1, num_labels):
+                    comp_area = int(stats[lab, cv2.CC_STAT_AREA])
+                    if 2 <= comp_area <= 380:
+                        comp_count += 1
+                if comp_count < 8:
+                    continue
+
+                # Kiem tra fill ratio contour
                 hull = cv2.convexHull(cnt)
                 hull_area = cv2.contourArea(hull)
                 if hull_area < 1:
                     continue
                 convexity = area / hull_area
-                if convexity < 0.5:
+                if convexity < 0.56:
                     continue
 
                 # Tinh chinh bbox
@@ -791,9 +1174,24 @@ def detect_qr_by_outline(img: np.ndarray, max_candidates: int = 4) -> List[np.nd
                 abs_x2 = x + cw
                 abs_y2 = y + ch
 
+                if blocked_mask is not None:
+                    blocked_ratio = masked_overlap_ratio(
+                        np.array(
+                            [[abs_x1, abs_y1], [abs_x2, abs_y1], [abs_x2, abs_y2], [abs_x1, abs_y2]],
+                            dtype=np.float32,
+                        ),
+                        blocked_mask,
+                    )
+                    if blocked_ratio > 0.02:
+                        continue
+
                 # Kiem tra trung lap
                 box = (abs_x1, abs_y1, abs_x2, abs_y2)
-                if any(bbox_iou_xyxy(box, old) > 0.4 for old in seen_boxes):
+                if any(
+                    bbox_iou_xyxy(box, old) > 0.35
+                    or boxes_overlap_or_touch(box, old, margin=1)
+                    for old in seen_boxes
+                ):
                     continue
 
                 quad = np.array([
@@ -811,6 +1209,239 @@ def detect_qr_by_outline(img: np.ndarray, max_candidates: int = 4) -> List[np.nd
 
     # Sap xep theo diem texture
     return results[:max_candidates * 2]
+
+
+def detect_dense_small_qr_components(
+    img: np.ndarray,
+    blocked_mask: Optional[np.ndarray] = None,
+    min_cluster_count: int = 25,
+    max_candidates: int = 220,
+) -> List[np.ndarray]:
+    """
+    Fast-path cho anh co nhieu QR nho, sat nhau.
+    Y tuong:
+    - Dung Otsu + connected-components de tach cac cum module QR
+    - Lay cum co dien tich dong deu (mode area), ratio hop ly
+    - NMS theo IoU de tranh trung lap
+    """
+    if img is None or img.size == 0:
+        return []
+
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    variants = [
+        (cv2.morphologyEx(
+            otsu,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        ), 2.0),
+        (otsu, 1.0),
+    ]
+
+    border = max(1, min(h, w) // 320)
+    area_upper = max(12000, int(h * w * 0.12))
+    candidates: List[Tuple[float, np.ndarray, float, float]] = []
+
+    for binary, src_weight in variants:
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        for lab in range(1, num_labels):
+            area = float(stats[lab, cv2.CC_STAT_AREA])
+            if area < 400 or area > area_upper:
+                continue
+
+            x = int(stats[lab, cv2.CC_STAT_LEFT])
+            y = int(stats[lab, cv2.CC_STAT_TOP])
+            bw = int(stats[lab, cv2.CC_STAT_WIDTH])
+            bh = int(stats[lab, cv2.CC_STAT_HEIGHT])
+            x2 = x + bw
+            y2 = y + bh
+
+            if bw < 14 or bh < 14:
+                continue
+            if x <= border or y <= border or x2 >= w - border or y2 >= h - border:
+                continue
+
+            ratio = max(bw, bh) / max(1.0, min(bw, bh))
+            if ratio > 2.6:
+                continue
+
+            quad = np.array([[x, y], [x2, y], [x2, y2], [x, y2]], dtype=np.float32)
+            if blocked_mask is not None and masked_overlap_ratio(quad, blocked_mask) > 0.03:
+                continue
+
+            score = src_weight + 0.0002 * area
+            candidates.append((score, quad, area, ratio))
+
+    if len(candidates) < min_cluster_count:
+        return []
+
+    areas = np.array([c[2] for c in candidates], dtype=np.float32)
+    area_mean = float(np.mean(areas))
+    area_std = float(np.std(areas))
+    area_cv = area_std / max(1e-6, area_mean)
+    if area_cv > 0.65:
+        return []
+
+    q1 = float(np.percentile(areas, 25))
+    q3 = float(np.percentile(areas, 75))
+    med = float(np.median(areas))
+    area_low = max(380.0, min(q1 * 0.90, med * 0.72))
+    area_high = max(area_low + 40.0, max(q3 * 1.20, med * 1.35))
+
+    filtered: List[Tuple[float, np.ndarray]] = []
+    for score, quad, area, ratio in candidates:
+        if area < area_low or area > area_high:
+            continue
+        if ratio > 1.75:
+            continue
+        filtered.append((score, quad))
+
+    if len(filtered) < max(8, min_cluster_count // 3):
+        return []
+
+    filtered.sort(key=lambda x: x[0], reverse=True)
+    selected: List[np.ndarray] = []
+    selected_boxes: List[Tuple[int, int, int, int]] = []
+    for _, q in filtered:
+        b = quad_to_box_int(q)
+        if any(bbox_iou_xyxy(b, old) > 0.34 for old in selected_boxes):
+            continue
+        selected.append(q)
+        selected_boxes.append(b)
+        if len(selected) >= max_candidates:
+            break
+    return selected
+
+
+def detect_qr_by_components(
+    img: np.ndarray,
+    blocked_mask: Optional[np.ndarray] = None,
+    max_candidates: int = 16,
+) -> List[np.ndarray]:
+    """
+    Detect QR theo connected-components + xac thuc finder-signature 7x7.
+    Muc tieu: bo sung khi finder-pattern global bi thieu va tranh nham Data Matrix.
+    """
+    if img is None or img.size == 0:
+        return []
+
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+    low_light = float(np.mean(gray)) < 105.0
+    # Preprocess giu bien cuc bo de khong gom ca vung toi lon thanh mot component.
+    enhanced = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+
+    _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    variants = [
+        (
+            cv2.morphologyEx(
+                otsu,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                iterations=1,
+            ),
+            2.0,
+        ),
+        (otsu, 1.0),
+        (
+            cv2.adaptiveThreshold(
+                enhanced,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                max(11, min(31, ((min(h, w) // 20) | 1))),
+                3,
+            ),
+            1.2,
+        ),
+    ]
+
+    min_area = max(280.0, float(h * w) * 0.0005)
+    max_area = max(8000.0, float(h * w) * 0.28)
+    border = max(1, min(h, w) // 320)
+
+    scored: List[Tuple[float, np.ndarray]] = []
+    for binary, src_weight in variants:
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        for lab in range(1, num_labels):
+            area = float(stats[lab, cv2.CC_STAT_AREA])
+            if area < min_area or area > max_area:
+                continue
+
+            x = int(stats[lab, cv2.CC_STAT_LEFT])
+            y = int(stats[lab, cv2.CC_STAT_TOP])
+            bw = int(stats[lab, cv2.CC_STAT_WIDTH])
+            bh = int(stats[lab, cv2.CC_STAT_HEIGHT])
+            x2 = x + bw
+            y2 = y + bh
+
+            if bw < 16 or bh < 16:
+                continue
+            if x <= border or y <= border or x2 >= w - border or y2 >= h - border:
+                continue
+
+            ratio = max(bw, bh) / max(1.0, min(bw, bh))
+            if ratio > 2.6:
+                continue
+            if low_light and (bw > int(0.58 * w) or bh > int(0.58 * h)):
+                continue
+            bbox_area = float(bw * bh)
+            fill = area / max(1.0, bbox_area)
+            fill_low = 0.22 if low_light else 0.15
+            if fill < fill_low or fill > 0.90:
+                continue
+
+            quad = np.array([[x, y], [x2, y], [x2, y2], [x, y2]], dtype=np.float32)
+            if blocked_mask is not None and masked_overlap_ratio(quad, blocked_mask) > 0.03:
+                continue
+
+            # CAI TIEN: Expand bbox them ~10% truoc khi verify de dam bao
+            # finder pattern (vong ngoai) duoc bao gom day du trong patch
+            expand_px = max(int(max(bw, bh) * 0.10), 8)
+            ex1 = max(0, x - expand_px)
+            ey1 = max(0, y - expand_px)
+            ex2 = min(w, x2 + expand_px)
+            ey2 = min(h, y2 + expand_px)
+            patch_gray = gray[ey1:ey2, ex1:ex2]
+            if patch_gray.size == 0:
+                continue
+            if not verify_qr_finder_signature(patch_gray):
+                continue
+
+            size_penalty = np.sqrt(bbox_area / max(1.0, float(h * w)))
+            score = (
+                src_weight
+                + 0.00004 * area
+                + 0.8 * fill
+                - (0.35 if low_light else 0.22) * size_penalty
+                - 0.08 * abs(ratio - 1.0)
+            )
+            scored.append((score, quad))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    selected: List[np.ndarray] = []
+    selected_boxes: List[Tuple[int, int, int, int]] = []
+    for _, q in scored:
+        b = quad_to_box_int(q)
+        if any(
+            bbox_iou_xyxy(b, old) > 0.34
+            or boxes_overlap_or_touch(b, old, margin=1)
+            for old in selected_boxes
+        ):
+            continue
+        selected.append(q)
+        selected_boxes.append(b)
+        if len(selected) >= max_candidates:
+            break
+    return selected
 
 
 def fallback_corner_cluster_quads(image: np.ndarray, max_candidates: int = 2) -> List[np.ndarray]:
@@ -832,6 +1463,7 @@ def fallback_corner_cluster_quads(image: np.ndarray, max_candidates: int = 2) ->
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    low_light = float(np.mean(gray)) < 105.0
 
     corners = cv2.goodFeaturesToTrack(
         gray,
@@ -926,6 +1558,8 @@ def fallback_corner_cluster_quads(image: np.ndarray, max_candidates: int = 2) ->
         transition_score = 0.5 * (row_trans + col_trans)
         if transition_score < 0.12:
             continue
+        if low_light and not verify_qr_finder_signature(patch):
+            continue
 
         candidate_box = (bx1, by1, bx2, by2)
         if any(bbox_iou_xyxy(candidate_box, old) > 0.55 for old in selected_boxes):
@@ -957,6 +1591,32 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
         return 0, []
 
     H_img, W_img = img.shape[:2]
+
+    # -----------------------------------------------------------------------
+    # FAST-PATH: Anh co rat nhieu QR nho, sat nhau (uu tien recall)
+    # -----------------------------------------------------------------------
+    dense_quads = detect_dense_small_qr_components(
+        img,
+        blocked_mask=None,
+        min_cluster_count=25,
+        max_candidates=220,
+    )
+    if len(dense_quads) >= 45:
+        dense_quads.sort(key=lambda q: (np.min(q[:, 1]), np.min(q[:, 0])))
+
+        corners_dense: List[List[Point]] = []
+        for q in dense_quads:
+            r = np.asarray(q, dtype=np.float32).reshape(4, 2)
+            x1 = int(np.min(r[:, 0]))
+            y1 = int(np.min(r[:, 1]))
+            x2 = int(np.max(r[:, 0]))
+            y2 = int(np.max(r[:, 1]))
+            if x2 - x1 < 8 or y2 - y1 < 8:
+                continue
+            corners_dense.append([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])
+
+        if corners_dense:
+            return len(corners_dense), corners_dense
 
     # -----------------------------------------------------------------------
     # BUOC 1: Thu tim bang finder-pattern
@@ -1017,7 +1677,16 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
             unique_patterns.append(cand)
 
     rough_quads = build_qr_quads(unique_patterns, img.shape)
-    rough_quads = suppress_overlapping_quads(rough_quads, iou_threshold=0.28)
+    rough_quads, blocked_regions = suppress_overlapping_quads(
+        rough_quads,
+        iou_threshold=0.26,
+        image_shape=(H_img, W_img),
+        return_regions=True,
+        touch_margin=0,  # CAI TIEN: khong loai QR chi vi chung sat nhau
+    )
+    # CAI TIEN: blocked_mask chi duoc fill sau khi rough quads da duoc validate
+    # (khong fill tu blocked_regions vi co the chua rough quad gia/qua lon)
+    blocked_mask = np.zeros((H_img, W_img), dtype=np.uint8)
 
     # -----------------------------------------------------------------------
     # BUOC 2: Tinh chinh toa do sang axis-aligned bbox
@@ -1026,6 +1695,18 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
     refined_boxes: List[Tuple[int, int, int, int]] = []
 
     for rq in rough_quads:
+        # CAI TIEN: Validate rough quad - loai bo neu qua lon (false positive)
+        rq2 = np.asarray(rq, dtype=np.float32).reshape(4, 2)
+        rq_w = float(np.max(rq2[:, 0]) - np.min(rq2[:, 0]))
+        rq_h = float(np.max(rq2[:, 1]) - np.min(rq2[:, 1]))
+        rq_area = rq_w * rq_h
+        # Neu rough quad chiem >25% dien tich anh -> kha nang false positive
+        if rq_area > H_img * W_img * 0.25:
+            continue
+        # Neu rough quad rong/cao qua nua anh -> skip
+        if rq_w > W_img * 0.70 or rq_h > H_img * 0.70:
+            continue
+
         refined = refine_to_axis_aligned_bbox(img, rq)
         if refined is None:
             # Neu khong refine duoc, dung axis-aligned bbox cua rough quad
@@ -1040,16 +1721,48 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
         x2 = int(np.max(r[:, 0]))
         y2 = int(np.max(r[:, 1]))
 
+        # Loai bo refined bbox qua lon
+        ref_area = (x2 - x1) * (y2 - y1)
+        if ref_area > H_img * W_img * 0.25 or (x2 - x1) > W_img * 0.70 or (y2 - y1) > H_img * 0.70:
+            continue
+
         box = (x1, y1, x2, y2)
-        if not any(bbox_iou_xyxy(box, old) > 0.4 for old in refined_boxes):
+        if not any(
+            bbox_iou_xyxy(box, old) > 0.35
+            for old in refined_boxes
+        ):
             refined_quads.append(refined)
             refined_boxes.append(box)
+            add_quad_to_mask(blocked_mask, refined, dilate_px=0)
+
+    # -----------------------------------------------------------------------
+    # BUOC 2.5: Bo sung bang connected-components + finder signature 7x7
+    # -----------------------------------------------------------------------
+    comp_quads = detect_qr_by_components(img, blocked_mask=blocked_mask, max_candidates=18)
+    for cq in comp_quads:
+        # Component box thuong la "tight", can no them de gom du QR khi anh xoay nhe.
+        rc = expand_axis_aligned_quad(cq, (H_img, W_img), pad_ratio=0.12, min_pad=4, max_pad=44)
+        rr = rc.reshape(4, 2)
+        cbox = (
+            int(np.min(rr[:, 0])),
+            int(np.min(rr[:, 1])),
+            int(np.max(rr[:, 0])),
+            int(np.max(rr[:, 1])),
+        )
+        if any(
+            bbox_iou_xyxy(cbox, old) > 0.32
+            for old in refined_boxes
+        ):
+            continue
+        refined_quads.append(rc)
+        refined_boxes.append(cbox)
+        add_quad_to_mask(blocked_mask, rc, dilate_px=0)
 
     # -----------------------------------------------------------------------
     # BUOC 3: Neu chua co du QR, thu phat hien bang contour outline
     # -----------------------------------------------------------------------
     # Chi them neu chua phat hien duoc gi, hoac thu them vung co the bo qua
-    outline_quads = detect_qr_by_outline(img, max_candidates=4)
+    outline_quads = detect_qr_by_outline(img, max_candidates=6, blocked_mask=blocked_mask)
 
     for oq in outline_quads:
         r = oq.reshape(4, 2)
@@ -1059,7 +1772,12 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
         y2 = int(np.max(r[:, 1]))
 
         box = (x1, y1, x2, y2)
-        if any(bbox_iou_xyxy(box, old) > 0.3 for old in refined_boxes):
+        if any(
+            bbox_iou_xyxy(box, old) > 0.30
+            for old in refined_boxes
+        ):
+            continue
+        if masked_overlap_ratio(oq, blocked_mask) > 0.10:
             continue
 
         # Kiem tra texture de dam bao day la QR
@@ -1080,9 +1798,13 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
         ry2 = int(np.max(r2[:, 1]))
         rbox = (rx1, ry1, rx2, ry2)
 
-        if not any(bbox_iou_xyxy(rbox, old) > 0.35 for old in refined_boxes):
+        if not any(
+            bbox_iou_xyxy(rbox, old) > 0.32
+            for old in refined_boxes
+        ):
             refined_quads.append(refined)
             refined_boxes.append(rbox)
+            add_quad_to_mask(blocked_mask, refined, dilate_px=0)
 
     # -----------------------------------------------------------------------
     # BUOC 4: Fallback neu van chua co gi
@@ -1090,13 +1812,29 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
     if not refined_quads:
         fallback = fallback_corner_cluster_quads(img, max_candidates=3)
         for fq in fallback:
+            if masked_overlap_ratio(fq, blocked_mask) > 0.03:
+                continue
             refined = refine_to_axis_aligned_bbox(img, fq)
             if refined is None:
                 q2 = np.asarray(fq, dtype=np.float32).reshape(4, 2)
                 x1, y1 = int(np.min(q2[:, 0])), int(np.min(q2[:, 1]))
                 x2, y2 = int(np.max(q2[:, 0])), int(np.max(q2[:, 1]))
                 refined = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+            r2 = refined.reshape(4, 2)
+            box = (
+                int(np.min(r2[:, 0])),
+                int(np.min(r2[:, 1])),
+                int(np.max(r2[:, 0])),
+                int(np.max(r2[:, 1])),
+            )
+            if any(
+                bbox_iou_xyxy(box, old) > 0.30 or boxes_overlap_or_touch(box, old, margin=1)
+                for old in refined_boxes
+            ):
+                continue
             refined_quads.append(refined)
+            refined_boxes.append(box)
+            add_quad_to_mask(blocked_mask, refined, dilate_px=1)
 
     # -----------------------------------------------------------------------
     # BUOC 5: NMS cuoi cung va sap xep ket qua
@@ -1116,7 +1854,10 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
             continue
 
         box = (x1, y1, x2, y2)
-        if any(bbox_iou_xyxy(box, old) > 0.35 for old in final_boxes):
+        if any(
+            bbox_iou_xyxy(box, old) > 0.32
+            for old in final_boxes
+        ):
             continue
 
         aa_quad = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
@@ -1449,6 +2190,8 @@ def main() -> None:
         data_csv_path = os.path.abspath(args.data)
         csv_dir = os.path.dirname(data_csv_path)
         output_path = os.path.join(script_dir, "output.csv")
+        result_dir = os.path.join(script_dir, "Result")
+        os.makedirs(result_dir, exist_ok=True)
 
         with open(data_csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -1477,6 +2220,43 @@ def main() -> None:
             num_qr, corners_list = process_image(img_path)
             print(f"Tim thay {num_qr} QR code")
 
+            # Luu anh grayscale + ve duong bao QR vao folder Result
+            img_vis_src = read_image_any_path(img_path)
+            if img_vis_src is not None:
+                gray_vis = cv2.cvtColor(img_vis_src, cv2.COLOR_BGR2GRAY) if img_vis_src.ndim == 3 else img_vis_src
+                vis = cv2.cvtColor(gray_vis, cv2.COLOR_GRAY2BGR)
+
+                for qr_idx, quad in enumerate(corners_list):
+                    pts = np.array([[int(round(x)), int(round(y))] for x, y in quad], dtype=np.int32).reshape(-1, 1, 2)
+                    cv2.polylines(vis, [pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+                    for p_idx, p in enumerate(pts.reshape(-1, 2)):
+                        px, py = int(p[0]), int(p[1])
+                        cv2.circle(vis, (px, py), 2, (0, 0, 255), -1, cv2.LINE_AA)
+                        cv2.putText(
+                            vis,
+                            f"{qr_idx}:{p_idx}",
+                            (px + 2, py - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.35,
+                            (255, 255, 0),
+                            1,
+                            cv2.LINE_AA,
+                        )
+
+                cv2.putText(
+                    vis,
+                    f"QR={num_qr}",
+                    (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                out_vis_path = os.path.join(result_dir, f"{image_id}.png")
+                if not write_image_any_path(out_vis_path, vis):
+                    print(f"Canh bao: khong ghi duoc anh Result cho {to_console_safe(image_id)}")
+
             if num_qr > 0:
                 for qr_index, quad in enumerate(corners_list):
                     (x0, y0), (x1, y1), (x2, y2), (x3, y3) = quad
@@ -1500,7 +2280,8 @@ def main() -> None:
             writer.writerows(results)
 
         print(f"\n{'='*70}")
-        print(f"DA GHI KET QUA VAO: {output_path}")
+        print(f"DA GHI KET QUA VAO: {to_console_safe(output_path)}")
+        print(f"DA GHI ANH VISUALIZE VAO: {to_console_safe(result_dir)}")
         print(f"{'='*70}\n")
 
         gt_path = (args.gt or "").strip()
