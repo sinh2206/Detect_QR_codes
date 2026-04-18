@@ -2143,14 +2143,138 @@ def detect_qr_by_bright_square(
     return selected
 
 
+def detect_blurry_wide_qr_components(
+    image: np.ndarray,
+    blocked_mask: Optional[np.ndarray] = None,
+    max_candidates: int = 8,
+) -> List[np.ndarray]:
+    """
+    Detect QR mo/perspective co dang ngang (ratio 1.6 -> 3.4),
+    thuong gap trong anh co nhieu QR nho theo cot/chuoi.
+    """
+    if image is None or image.size == 0:
+        return []
+
+    h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
+    enhanced = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+    binaries = [
+        cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 17, 2),
+        cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 3),
+        cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 4),
+    ]
+
+    border = max(1, min(h, w) // 320)
+    scored: List[Tuple[float, np.ndarray, int, int]] = []
+    for binary in binaries:
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        for lab in range(1, num_labels):
+            area = float(stats[lab, cv2.CC_STAT_AREA])
+            x = int(stats[lab, cv2.CC_STAT_LEFT])
+            y = int(stats[lab, cv2.CC_STAT_TOP])
+            bw = int(stats[lab, cv2.CC_STAT_WIDTH])
+            bh = int(stats[lab, cv2.CC_STAT_HEIGHT])
+            x2 = x + bw
+            y2 = y + bh
+
+            if bw < 70 or bh < 24 or bw > 220 or bh > 130:
+                continue
+            if x <= border or y <= border or x2 >= w - border or y2 >= h - border:
+                continue
+
+            ratio = max(bw, bh) / max(1.0, min(bw, bh))
+            if ratio < 1.6 or ratio > 3.4:
+                continue
+
+            fill = area / max(1.0, float(bw * bh))
+            if fill < 0.18 or fill > 0.70:
+                continue
+
+            patch = gray[y:y2, x:x2]
+            if patch.size == 0:
+                continue
+            trans = _qr_transition_score(patch, target_size=48)
+            std_val = float(np.std(patch))
+            if trans < 0.22 or std_val < 30.0:
+                continue
+            if not _has_qr_texture_signature(patch):
+                continue
+
+            quad = np.array([[x, y], [x2, y], [x2, y2], [x, y2]], dtype=np.float32)
+            if blocked_mask is not None and masked_overlap_ratio(quad, blocked_mask) > 0.03:
+                continue
+
+            score = 1.8 * trans + 0.01 * std_val + 0.12 * fill
+            scored.append((score, quad, bw, bh))
+
+    if not scored:
+        return []
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    deduped: List[Tuple[float, np.ndarray, int, int]] = []
+    for item in scored:
+        b = quad_to_box_int(item[1])
+        if any(bbox_iou_xyxy(b, quad_to_box_int(old[1])) > 0.45 for old in deduped):
+            continue
+        deduped.append(item)
+        if len(deduped) >= 32:
+            break
+
+    # Uu tien nhom co kich thuoc tuong dong va gan cung x-center.
+    clusters: List[List[int]] = []
+    used = [False] * len(deduped)
+    for i, cur in enumerate(deduped):
+        if used[i]:
+            continue
+        used[i] = True
+        member = [i]
+        cur_box = quad_to_box_int(cur[1])
+        cur_cx = 0.5 * (cur_box[0] + cur_box[2])
+        cur_w = cur[2]
+        cur_h = cur[3]
+        for j, cand in enumerate(deduped):
+            if used[j]:
+                continue
+            b = quad_to_box_int(cand[1])
+            cx = 0.5 * (b[0] + b[2])
+            if abs(cur_cx - cx) > max(28.0, 0.35 * min(float(cur_w), float(cand[2]))):
+                continue
+            wr = min(cur_w, cand[2]) / max(1.0, float(max(cur_w, cand[2])))
+            hr = min(cur_h, cand[3]) / max(1.0, float(max(cur_h, cand[3])))
+            if wr > 0.65 and hr > 0.60:
+                used[j] = True
+                member.append(j)
+        clusters.append(member)
+
+    if not clusters:
+        return []
+    clusters.sort(key=lambda ids: (len(ids), float(sum(deduped[k][0] for k in ids))), reverse=True)
+    best_cluster = clusters[0]
+    if len(best_cluster) < 2:
+        return []
+
+    selected: List[np.ndarray] = []
+    selected_boxes: List[Tuple[int, int, int, int]] = []
+    for idx in best_cluster:
+        q = deduped[idx][1]
+        b = quad_to_box_int(q)
+        if any(bbox_iou_xyxy(b, old) > 0.35 for old in selected_boxes):
+            continue
+        selected.append(q)
+        selected_boxes.append(b)
+        if len(selected) >= max_candidates:
+            break
+    return selected
+
+
 def detect_tiny_qr_row_clusters(
     image: np.ndarray,
     blocked_mask: Optional[np.ndarray] = None,
-    max_candidates: int = 2,
+    max_candidates: int = 8,
 ) -> List[np.ndarray]:
     """
-    Fallback cho QR rat nho (vd 20-40 px), thuong xuat hien theo cum ngang.
-    Dung seed components + cluster ngang de giam nham voi chu cai.
+    Detect QR rat nho (seed 6-34 px) theo row ngang.
+    Muc tieu: bat cac QR mo/nho ben duoi QR lon.
     """
     if image is None or image.size == 0:
         return []
@@ -2175,29 +2299,29 @@ def detect_tiny_qr_row_clusters(
         num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         for lab in range(1, num_labels):
             area = float(stats[lab, cv2.CC_STAT_AREA])
-            if area < 20.0 or area > 420.0:
+            if area < 18.0 or area > 420.0:
                 continue
 
             x = int(stats[lab, cv2.CC_STAT_LEFT])
             y = int(stats[lab, cv2.CC_STAT_TOP])
             bw = int(stats[lab, cv2.CC_STAT_WIDTH])
             bh = int(stats[lab, cv2.CC_STAT_HEIGHT])
-            if bw < 6 or bh < 6 or bw > 24 or bh > 24:
+            if bw < 6 or bh < 6 or bw > 34 or bh > 34:
                 continue
 
             ratio = max(bw, bh) / max(1.0, min(bw, bh))
-            if ratio > 2.0:
+            if ratio > 2.2:
                 continue
 
             patch = gray[y:y + bh, x:x + bw]
             if patch.size == 0:
                 continue
             std_val = float(np.std(patch))
-            if std_val < 16.0:
+            if std_val < 14.0:
                 continue
 
             trans = _qr_transition_score(patch, target_size=24)
-            if trans < 0.11:
+            if trans < 0.10:
                 continue
 
             target = 24
@@ -2218,7 +2342,7 @@ def detect_tiny_qr_row_clusters(
                     ratio_dark = float(np.mean(bb[y0:y1, x0:x1] > 0))
                     if 0.10 <= ratio_dark <= 0.90:
                         mixed += 1
-            if mixed < 10:
+            if mixed < 9:
                 continue
 
             score = 1.8 * trans + 0.01 * std_val - 0.05 * abs(ratio - 1.0)
@@ -2234,126 +2358,79 @@ def detect_tiny_qr_row_clusters(
             continue
         deduped.append(seed)
 
-    used = [False] * len(deduped)
-    clusters: List[List[int]] = []
-    for i in range(len(deduped)):
-        if used[i]:
-            continue
-        used[i] = True
-        members = [i]
-        stack = [i]
-        while stack:
-            u = stack.pop()
-            b1 = deduped[u][1]
-            c1 = ((b1[0] + b1[2]) * 0.5, (b1[1] + b1[3]) * 0.5)
-            for j in range(len(deduped)):
-                if used[j]:
-                    continue
-                b2 = deduped[j][1]
-                c2 = ((b2[0] + b2[2]) * 0.5, (b2[1] + b2[3]) * 0.5)
-                if abs(c1[0] - c2[0]) <= 16 and abs(c1[1] - c2[1]) <= 16:
-                    used[j] = True
-                    members.append(j)
-                    stack.append(j)
-        clusters.append(members)
-
-    scored_candidates: List[Tuple[float, Tuple[int, int, int, int]]] = []
-    for members in clusters:
-        boxes = [deduped[k][1] for k in members]
-        ux1 = min(b[0] for b in boxes)
-        uy1 = min(b[1] for b in boxes)
-        ux2 = max(b[2] for b in boxes)
-        uy2 = max(b[3] for b in boxes)
-        uw = ux2 - ux1
-        uh = uy2 - uy1
-
-        if len(members) == 1:
-            side = max(uw, uh)
-            tw = max(18, int(round(side * 2.2)))
-            th = max(16, int(round(side * 1.8)))
-            cx = (ux1 + ux2) * 0.5
-            cy = (uy1 + uy2) * 0.5
-            x1 = int(round(cx - tw * 0.5))
-            y1 = int(round(cy - th * 0.5))
-            x2 = x1 + tw
-            y2 = y1 + th
-        else:
-            pad_x = max(2, int(0.10 * uw))
-            pad_top = max(1, int(0.10 * uh))
-            pad_bottom = max(6, int(0.55 * uh) + 2)
-            x1 = ux1 - pad_x
-            y1 = uy1 - pad_top
-            x2 = ux2 + pad_x
-            y2 = uy2 + pad_bottom
-
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(w, x2)
-        y2 = min(h, y2)
-        if x2 - x1 < 14 or y2 - y1 < 14:
-            continue
-        if x2 - x1 > 56 or y2 - y1 > 56:
+    # Tao nhom theo hang ngang, uu tien nhom co khoang cach x deu.
+    groups: List[List[int]] = []
+    for i, seed in enumerate(deduped):
+        cy_ref = 0.5 * (seed[1][1] + seed[1][3])
+        idx = [
+            j for j, s in enumerate(deduped)
+            if abs(0.5 * (s[1][1] + s[1][3]) - cy_ref) <= 10.0
+        ]
+        if len(idx) < 2:
             continue
 
+        idx = sorted(idx, key=lambda k: 0.5 * (deduped[k][1][0] + deduped[k][1][2]))
+        filtered_idx: List[int] = []
+        for k in idx:
+            if filtered_idx and bbox_iou_xyxy(deduped[k][1], deduped[filtered_idx[-1]][1]) > 0.45:
+                continue
+            filtered_idx.append(k)
+        if len(filtered_idx) < 2:
+            continue
+
+        centers_x = [0.5 * (deduped[k][1][0] + deduped[k][1][2]) for k in filtered_idx]
+        centers_y = [0.5 * (deduped[k][1][1] + deduped[k][1][3]) for k in filtered_idx]
+        gaps = [centers_x[t + 1] - centers_x[t] for t in range(len(centers_x) - 1)]
+        if len(gaps) == 0:
+            continue
+        gap_med = float(np.median(np.array(gaps, dtype=np.float32)))
+        if gap_med < 12.0 or gap_med > 80.0:
+            continue
+        if len(gaps) >= 2:
+            gap_cv = float(np.std(np.array(gaps, dtype=np.float32))) / max(1e-6, float(np.mean(np.array(gaps, dtype=np.float32))))
+            if gap_cv > 0.45:
+                continue
+        if max(centers_y) - min(centers_y) > 10.0:
+            continue
+
+        if len(filtered_idx) == 2:
+            if min(deduped[filtered_idx[0]][0], deduped[filtered_idx[1]][0]) < 0.95:
+                continue
+
+        groups.append(filtered_idx)
+
+    if not groups:
+        return []
+
+    # Chon nhom tot nhat: uu tien nhieu phan tu, sau do tong score.
+    groups_unique: List[List[int]] = []
+    seen = set()
+    for g in groups:
+        key = tuple(g)
+        if key in seen:
+            continue
+        seen.add(key)
+        groups_unique.append(g)
+    groups_unique.sort(
+        key=lambda g: (len(g), float(sum(deduped[k][0] for k in g))),
+        reverse=True,
+    )
+    best = groups_unique[0]
+
+    quads: List[np.ndarray] = []
+    for k in best:
+        x1, y1, x2, y2 = deduped[k][1]
+        # Nhe tay mo rong de phu toa do GT tiny-QR on dinh hon.
+        x1 = max(0, x1 - 1)
+        y1 = max(0, y1 - 1)
+        x2 = min(w, x2 + 1)
+        y2 = min(h, y2 + 2)
         quad = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
         if blocked_mask is not None and masked_overlap_ratio(quad, blocked_mask) > 0.03:
             continue
-
-        patch = gray[y1:y2, x1:x2]
-        if patch.size == 0:
-            continue
-        if not _looks_like_micro_qr_patch(patch):
-            continue
-
-        trans = _qr_transition_score(patch, target_size=24)
-        std_val = float(np.std(patch))
-        if trans < 0.11 or std_val < 14.0:
-            continue
-
-        score = 1.4 * trans + 0.008 * std_val + 0.35 * float(len(members))
-        scored_candidates.append((score, (x1, y1, x2, y2)))
-
-    if not scored_candidates:
-        return []
-
-    scored_candidates.sort(key=lambda t: t[0], reverse=True)
-    candidates: List[Tuple[float, Tuple[int, int, int, int]]] = []
-    for item in scored_candidates:
-        if any(bbox_iou_xyxy(item[1], old[1]) > 0.35 for old in candidates):
-            continue
-        candidates.append(item)
-        if len(candidates) >= 6:
+        quads.append(quad)
+        if len(quads) >= max_candidates:
             break
-
-    # Chi nhan khi tim thay cap tiny-QR cung hang (giam false-positive text).
-    pair: Optional[Tuple[int, int]] = None
-    best_pair_score = -1e9
-    for i in range(len(candidates)):
-        for j in range(i + 1, len(candidates)):
-            b1 = candidates[i][1]
-            b2 = candidates[j][1]
-            c1x = (b1[0] + b1[2]) * 0.5
-            c1y = (b1[1] + b1[3]) * 0.5
-            c2x = (b2[0] + b2[2]) * 0.5
-            c2y = (b2[1] + b2[3]) * 0.5
-            dy = abs(c1y - c2y)
-            dx = abs(c1x - c2x)
-            if dy <= 14.0 and 10.0 <= dx <= 90.0:
-                pair_score = candidates[i][0] + candidates[j][0]
-                if pair_score > best_pair_score:
-                    best_pair_score = pair_score
-                    pair = (i, j)
-
-    selected_boxes: List[Tuple[int, int, int, int]] = []
-    if pair is not None:
-        selected_boxes = [candidates[pair[0]][1], candidates[pair[1]][1]]
-    elif candidates and candidates[0][0] >= 1.8:
-        selected_boxes = [candidates[0][1]]
-
-    quads: List[np.ndarray] = []
-    for b in selected_boxes[:max_candidates]:
-        x1, y1, x2, y2 = b
-        quads.append(np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32))
     return quads
 
 
