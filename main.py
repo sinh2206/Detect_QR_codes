@@ -2,10 +2,10 @@
 """
 Phat hien va dinh vi QR code bang xu ly anh truyen thong.
 Khong dung QRCodeDetector/deep learning.
-CAI TIEN V2:
-- Them refine_to_axis_aligned_bbox() vi toan bo GT la axis-aligned rectangles
-- Them detect_qr_by_outline() phat hien QR qua contour truc tiep
-- Tinh chinh toa do chinh xac hon bang cach quet vung binary
+
+Modun xu ly anh va phat hien QR code tren cac hinh anh.
+Su dung phuong phap finder-pattern detection, contour analysis,
+va connected-components de phat hien QR codes.
 """
 
 import argparse  # Xu li tham so command-line
@@ -558,11 +558,6 @@ def build_qr_quads(patterns: List[Tuple[Contour, Point, float]], image_shape: Tu
                         chosen.append(box[int(np.argmax(scores))])
 
                     tl_pt, tr_pt, bl_pt = chosen
-
-                    # ---------------------------------------------------
-                    # CAI TIEN: Tinh BR dung homography tu 3 tam finder pattern
-                    # Thay vi dung cong thuc hinh binh hanh (bi sai khi co perspective distortion)
-                    # ---------------------------------------------------
                     # TL_center, TR_center, BL_center trong khong gian anh
                     tl_c = centers[tl_idx]
                     tr_c = centers[tr_idx]
@@ -722,12 +717,6 @@ def suppress_overlapping_quads(
     if return_regions:
         return selected, selected_regions
     return selected
-
-
-# ===========================================================================
-# CAI TIEN CHINH: Tinh chinh toa do ve axis-aligned bounding box
-# Toan bo ground truth la axis-aligned rectangles
-# ===========================================================================
 
 def binarize_patch(gray: np.ndarray) -> np.ndarray:
     """Nhi phan hoa patch de phat hien vung QR."""
@@ -1916,7 +1905,6 @@ def detect_qr_by_components(
             if blocked_mask is not None and masked_overlap_ratio(quad, blocked_mask) > 0.03:
                 continue
 
-            # CAI TIEN: Expand bbox them ~10% truoc khi verify de dam bao
             # finder pattern (vong ngoai) duoc bao gom day du trong patch
             expand_px = max(int(max(bw, bh) * 0.10), 8)
             ex1 = max(0, x - expand_px)
@@ -2726,9 +2714,8 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
         iou_threshold=0.26,
         image_shape=(H_img, W_img),
         return_regions=True,
-        touch_margin=0,  # CAI TIEN: khong loai QR chi vi chung sat nhau
+        touch_margin=0,  
     )
-    # CAI TIEN: blocked_mask chi duoc fill sau khi rough quads da duoc validate
     # (khong fill tu blocked_regions vi co the chua rough quad gia/qua lon)
     blocked_mask = np.zeros((H_img, W_img), dtype=np.uint8)
 
@@ -2739,7 +2726,6 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
     refined_boxes: List[Tuple[int, int, int, int]] = []
 
     for rq in rough_quads:
-        # CAI TIEN: Validate rough quad - loai bo neu qua lon (false positive)
         rq2 = np.asarray(rq, dtype=np.float32).reshape(4, 2)
         rq_w = float(np.max(rq2[:, 0]) - np.min(rq2[:, 0]))
         rq_h = float(np.max(rq2[:, 1]) - np.min(rq2[:, 1]))
@@ -2984,11 +2970,6 @@ def process_image(image_path: str) -> Tuple[int, List[List[Point]]]:
         corners.append([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])
 
     return len(corners), corners
-
-
-# ===========================================================================
-# Cac ham danh gia (giu nguyen)
-# ===========================================================================
 
 def polygon_signed_area(poly: np.ndarray) -> float:
         """
@@ -3488,7 +3469,7 @@ def main() -> None:
         else:
             print("Canh bao: khong tim thay ground-truth de danh gia tu dong.")
         
-        # ===== DANH GIA TOC DO (theo requirement 5.5) =====
+        # ===== DANH GIA TOC DO =================
         # Tính toán tổng thời gian chạy (wall-clock time) từ lúc bắt đầu đến hiện tại
         end_time = time.time()
         total_time = end_time - start_time
